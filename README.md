@@ -11,8 +11,12 @@ together.
 
 ## Methodology
 
-**Model & dataset.** `Qwen3.5-2B` is the base model, evaluated against quantized
-checkpoints of the same model.
+**Model & dataset.** `Qwen3.5-2B` is the base model, evaluated in three variants: full
+precision (fp16), AWQ ([`QuantTrio/Qwen3.5-2B-AWQ`](https://huggingface.co/QuantTrio/Qwen3.5-2B-AWQ)),
+and GPTQ — GPTQ is currently a placeholder in the notebook (`MODEL_CONFIGS`) since no
+public Qwen3.5-2B GPTQ checkpoint exists yet; it's skipped automatically (loudly, not
+silently) until one is filled in. Which variants actually run is controlled by the
+`BENCHMARK_MODELS` toggle at the top of the notebook.
 Evaluation uses `MME-RealWorld`, a multiple-choice, image-grounded VQA benchmark
 split into `Reasoning` and `Perception` tasks. A stratified 10% sample (same
 proportion pulled from each task) is used for fast iteration; full-dataset runs are
@@ -57,6 +61,74 @@ present.
 
 Package installs use [`uv`](https://github.com/astral-sh/uv) instead of pip for
 faster environment setup. Model weights and dataset come from Hugging Face Hub.
+The Colab runtime this notebook targets is a T4 GPU (16GB VRAM) — a real constraint
+on several of the choices below, not just Colab's default.
+
+## Optimization methods
+
+Speed work falls into three buckets: not re-fetching things, not re-computing things,
+and getting more out of the GPU per second it's busy. In roughly the order they pay
+off:
+
+- **Downloads are concurrent and accelerated.** All enabled models' weights download
+  in parallel (`ThreadPoolExecutor` around `snapshot_download`) instead of one after
+  another, and `HF_HUB_ENABLE_HF_TRANSFER=1` swaps in HF's Rust-based accelerated
+  downloader for the actual transfer. Combined with everything landing on Drive (see
+  Infrastructure above), a repo/weight/dataset is fetched at most once, ever, per
+  Drive.
+- **Sampled images are staged to local disk before decoding.** `EXTRACT_DIR` on
+  Drive is a single flat directory holding every image in the full dataset, not
+  just the sample — per-file lookups against a Drive-mounted directory that large
+  are slow, and Drive's per-user rate limiting can add further backoff under
+  concurrent access. The ~10% sample's images are bulk-copied to local disk once
+  (skipping any already staged, so an interrupted copy resumes), and the actual
+  decode step reads from that local copy instead of Drive.
+- **Images are decoded once, not once per model.** The sample question set and every
+  model variant (fp16/AWQ/GPTQ) share the exact same images and prompts — the only
+  thing that changes between runs is which `LLM` processes them. Chat payloads are
+  built once up front with a thread pool and reused across all three inference
+  passes, instead of being rebuilt from scratch for each one. Trade-off: this holds
+  every decoded image in memory for the run, which is fine for the 10% sample but
+  worth revisiting for a full-dataset run.
+- **`max_model_len` is sized to the actual workload, not the model's ceiling.**
+  MME prompts are one image plus a short question, nowhere near vLLM's reported
+  context ceiling. A needlessly large `max_model_len` reserves KV-cache block
+  space for sequence lengths that never occur, directly capping how many requests
+  can run concurrently — so it's set to 8192, the single largest throughput lever
+  here, especially on a 16GB T4.
+  - `max_num_seqs` is set explicitly (64) and `gpu_memory_utilization` is held
+    constant across fp16/AWQ/GPTQ on purpose — letting a smaller quantized model
+    grab extra KV-cache headroom would make it look faster for a reason unrelated to
+    quantization, which would make the latency/TTFT/TPOT comparison unfair rather
+    than actually reflecting the method.
+- **One inference call per chunk, not one per item.** Requests within a chunk are
+  handed to `llm.chat()` together so vLLM's own continuous-batching scheduler
+  interleaves prefill/decode across them, instead of the caller synchronizing on
+  small sub-batches and leaving the GPU idle between them. The chunk size is tied to
+  `max_num_seqs` so each chunk is actually large enough to saturate the scheduler —
+  incremental result checkpointing (so a killed Colab kernel doesn't lose progress)
+  still happens once per chunk.
+- **CUDA graphs are captured for a range of batch sizes, not just one.** vLLM
+  only gets the CUDA-graph speedup for batch sizes it captured a graph for; a
+  partial trailing chunk (say 47 of 64 items) needs its own captured size, or it
+  falls back to slow eager execution. `cudagraph_capture_sizes` covers a full
+  range (`[1, 2, 4, 8, 16, 32, 64]`), not just the endpoints, so odd-sized
+  trailing chunks stay on the fast path.
+- **Prefix caching is on.** Every request shares the same chat-template preamble;
+  `enable_prefix_caching=True` lets vLLM skip recomputing it. Modest, since the
+  image and question content still differ per request, but free.
+- **`dtype="float16"`, deliberately.** T4 (Turing) has no native bf16 tensor cores,
+  so fp16 isn't just a default here — it's the dtype that actually runs fast on this
+  hardware.
+- **A known ceiling: Marlin kernels need Ampere+.** vLLM auto-upgrades AWQ/GPTQ to
+  its fast Marlin kernel on Ampere-or-newer GPUs; T4 (sm_75, Turing) doesn't qualify,
+  so quantized runs on this notebook's hardware fall back to a slower (but correct)
+  kernel. This isn't something the code controls — worth checking the vLLM startup
+  log for which kernel actually got selected, since it matters more for quantized
+  throughput than anything above.
+- **Metrics come from vLLM's own per-request timestamps**, not wall-clock timing
+  wrapped around a batch call — see the Metrics table above and `CLAUDE.md` for why
+  that distinction matters for TTFT/TPOT specifically.
 
 ## Outline
 
@@ -72,8 +144,9 @@ faster environment setup. Model weights and dataset come from Hugging Face Hub.
    method) over the question set in batches, writing results incrementally so a
    killed kernel doesn't lose progress.
 5. **Evaluate** — score each result set with the official MME-RealWorld evaluator.
-6. **Benchmark** — collect latency/TTFT/TPOT/memory metrics per quantization method
-   (in progress — see `CLAUDE.md` for current status).
+6. **Benchmark** — collect latency/TTFT/TPOT/memory metrics per quantization method,
+   sourced from vLLM's own per-request timestamps, and write both per-model and a
+   combined `benchmark_summary.json`.
 7. **Record** — commit the notebook (with outputs) and result artifacts after every
    run, so both the numbers and the trail of what was tried/fixed are preserved in
    git history.
