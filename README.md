@@ -32,18 +32,48 @@ previous model's residency.
 
 | Metric | What it captures |
 |---|---|
+| Model load time | Wall time to construct `vllm.LLM(...)`, kept separate from inference wall time |
 | Latency (avg) | Mean end-to-end request latency |
 | Latency (time-weighted) | Latency weighted by output length, so long generations don't get diluted by short ones in the average |
 | Latency (p50/p90/p99) | Median and tail end-to-end latency — averages hide the slow requests that matter most for user-facing behavior |
 | TTFT (avg + p50/p90/p99) | Time to first token — responsiveness / prefill cost, distribution not just mean |
 | TPOT (avg + p50/p90/p99) | Time per output token — steady-state decode throughput, distribution not just mean |
-| Memory (load) | Peak/allocated VRAM once the model is resident |
+| Queue / prefill / decode time | vLLM's own breakdown of where request time goes — separates scheduler backpressure from actual prefill/decode cost |
+| Throughput (req/s, tokens/s) | Aggregate throughput over the whole pass, the headline number for comparing methods |
+| Preemptions | Count of requests evicted-and-recomputed under KV-cache pressure, and how many requests were affected — explains latency outliers that aren't about raw decode speed |
+| Corrupted requests | Count of requests vLLM itself flagged as corrupted — a nonzero count means the accuracy number for that run may not be trustworthy |
+| Memory (load) | Peak VRAM used during load + inference |
 | Memory (unload delta) | VRAM not reclaimed after teardown — catches quantization backends that leak or fragment memory |
 | Accuracy | MME-RealWorld score via the benchmark's own `eval_your_results.py`, so numbers stay comparable to published results |
 
-Additional metrics get added here as they turn out to matter (e.g. throughput under
-concurrent load, quantization/load time itself) — this table is the current set, not
-a fixed spec.
+Additional metrics get added here as they turn out to matter — this table is the
+current set, not a fixed spec.
+
+**Where these numbers actually come from, and why it isn't as simple as reading
+`RequestOutput.metrics`.** vLLM's offline batch API doesn't hand you per-request
+timing for free — its `LLM` class defaults per-request metric collection to *off*,
+and even with it explicitly enabled, the object you get back has gone through more
+than one redesign across vLLM versions, so the field names aren't the ones you'd
+find in older docs or examples. Latency/TTFT/TPOT here are computed from that
+object with both of those accounted for explicitly, not assumed. Memory numbers
+come from querying the GPU device directly (NVML) rather than the Python process's
+own CUDA accounting, since vLLM runs the actual model in a separate subprocess —
+`torch.cuda.*` in the calling process can't see memory that process never
+allocated. See `CLAUDE.md` for the specifics if either of these need touching
+again.
+
+**Where these numbers actually come from, and why it isn't as simple as reading
+`RequestOutput.metrics`.** vLLM's offline batch API doesn't hand you per-request
+timing for free — its `LLM` class defaults per-request metric collection to *off*,
+and even with it explicitly enabled, the object you get back has gone through more
+than one redesign across vLLM versions, so the field names aren't the ones you'd
+find in older docs or examples. Latency/TTFT/TPOT here are computed from that
+object with both of those accounted for explicitly, not assumed. Memory numbers
+come from querying the GPU device directly (NVML) rather than the Python process's
+own CUDA accounting, since vLLM runs the actual model in a separate subprocess —
+`torch.cuda.*` in the calling process can't see memory that process never
+allocated. See `CLAUDE.md` for the specifics if either of these need touching
+again.
 
 **Accuracy scoring** always goes through the upstream `MME-RealWorld` evaluation
 script rather than a custom scorer, to avoid silently drifting from how the
@@ -80,6 +110,13 @@ off:
   downloader for the actual transfer. Combined with everything landing on Drive (see
   Infrastructure above), a repo/weight/dataset is fetched at most once, ever, per
   Drive.
+- **vLLM's kernel-compilation cache persists across sessions too, not just
+  weights/dataset.** Each engine startup normally recompiles the Triton/CUDA
+  kernels behind its `torch.compile`/CUDA-graph path from scratch; that cache
+  is pointed at local disk (fast) and round-tripped to a single tarball on
+  Drive once per model pass, so a fresh Colab runtime restores it instead of
+  paying full compilation cost on every startup for every model, every
+  session.
 - **Weights are staged to local disk before vLLM loads them.** Unlike the
   many-small-image problem below, weight files are few and large (a handful of
   safetensors shards) — bulk sequential reads are Drive's best case, not its worst.
@@ -89,16 +126,25 @@ off:
   reads depending on access order, which would reintroduce the same problem the
   image staging below fixes — just hidden inside one file instead of spread across
   many.
-- **All Drive access is isolated to one staging step.** `EXTRACT_DIR` on Drive is a
-  single flat directory holding every image in the full dataset, not just the
-  sample — per-file lookups against a Drive-mounted directory that large are slow,
-  Drive's per-user rate limiting can add further backoff under concurrent access,
-  and Drive can fail a read outright with an I/O error under load rather than just
-  being slow. The ~10% sample's images are bulk-copied to local disk once, with
-  retries around each copy (skipping any already staged, so an interrupted run
-  resumes), and every read after that point — for every model, every batch — comes
-  from that local copy instead of Drive.
-- **Images are read as base64, not decoded locally.** Each staged image is read as
+- **Raw images are only fetched for what isn't already cached, and never
+  extracted on Drive.** Once the sample and the base64 cache (below) are known, the
+  notebook works out which needed images the cache doesn't cover. If there are none,
+  no raw image is touched. Otherwise only those are staged from the flattened
+  image folder already on Drive (one directory listing, then 8 retrying threads);
+  and only if that folder is missing or incomplete does it copy the dataset archives
+  to local disk and extract them there — never onto Drive, since thousands of small
+  writes over Drive's FUSE mount are as slow and failure-prone as thousands of
+  small reads.
+- **The base64-encoded images themselves are cached and persisted to Drive.**
+  Reading and base64-encoding an image happens once per model pass by design (see
+  the windowed chat-building point below) and again on every fresh Colab session —
+  `IMAGE_CACHE` (`{basename: data_url}`) means that work happens at most once,
+  ever, per image. It's filled lazily inside `build_chat` (a cache miss is
+  encoded and stored right there, no separate build pass), and saved back to
+  `PROJECT_DIR/base64_image_cache.json` on Drive after every model pass — not just
+  once at the end — so a crash partway through a run doesn't throw away
+  cache-filling work already done.
+- **Images are read as base64, not decoded locally.** Each cached image is read as
   raw bytes and base64-encoded into vLLM's `image_url` content type, rather than
   opened with PIL and passed as `image_pil`. This skips a local decode step
   entirely (vLLM decodes on its own side) and keeps each chat payload close to the
@@ -180,12 +226,21 @@ off:
    method) over the question set in batches, writing results incrementally so a
    killed kernel doesn't lose progress.
 5. **Evaluate** — score each result set with the official MME-RealWorld evaluator.
-6. **Benchmark** — collect latency/TTFT/TPOT/memory metrics per quantization method,
-   sourced from vLLM's own per-request timestamps, and write both per-model and a
-   combined `benchmark_summary.json`.
-7. **Record** — commit the notebook (with outputs) and result artifacts after every
-   run, so both the numbers and the trail of what was tried/fixed are preserved in
-   git history.
+6. **Benchmark** — collect load-time/latency/TTFT/TPOT/queue-prefill-decode/
+   throughput/preemption/memory metrics per quantization method, sourced from
+   vLLM's own per-request timestamps, and write both per-model
+   (`benchmarks/<key>_metrics.json`) and a combined
+   (`benchmarks/benchmark_summary.json`) file.
+7. **Record** — commit the notebook (with outputs) and the `benchmarks/`
+   artifacts after every run, so both the numbers and the trail of what was
+   tried/fixed are preserved in git history.
+
+If any cell raises an uncaught exception and `BREAK_ON_ERR` (top of the
+notebook) is set, the Colab runtime disconnects itself rather than sitting
+idle/billing after an unattended run dies partway through — set it to `0`
+while iterating interactively. Between sessions, vLLM's `torch.compile`
+kernel-compilation cache round-trips to a single tarball on Drive so a fresh
+runtime doesn't recompile from scratch on every engine startup.
 
 ## Repo layout
 
@@ -193,6 +248,12 @@ off:
 - `README.md` — this file.
 - `CLAUDE.md` — working conventions for this repo (env quirks, storage layout,
   benchmarking/commit conventions) for anyone (human or AI) picking this up.
+- `benchmarks/` — per-model metrics JSON, a combined summary JSON, and the
+  MME-RealWorld eval script's output, one set per benchmarked variant. Small
+  and git-friendly, committed after every run (see Commit discipline in
+  `CLAUDE.md`). The notebook writes them to `PROJECT_DIR/benchmarks/` on Drive so
+  they survive the runtime disconnecting; copy that folder here to commit it.
 
-Large artifacts (weights, HF cache, dataset images, result JSONs) intentionally live
-on Google Drive, not in this repo.
+Large, per-run artifacts — model weights, the HF cache, dataset images, and the
+raw per-item model output JSON that `benchmarks/` is summarized from —
+intentionally live on Google Drive, not in this repo.

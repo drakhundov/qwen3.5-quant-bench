@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local working notes, not project documentation -- never committed
+EXPLANATION.md
