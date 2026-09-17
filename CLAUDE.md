@@ -27,20 +27,19 @@ using vLLM for inference, entirely inside Google Colab notebooks.
 - Package manager: `uv` (not pip/conda) for speed — `uv venv --python 3.12 --seed`,
   then `uv pip install`. `torchaudio` is explicitly uninstalled because vLLM's CUDA
   version check conflicts with it and it isn't needed.
-- Secrets: `HF_TOKEN` (and `HUGGINGFACE_API_KEY`, same value) come from Colab's
-  `userdata.get(...)`, not hardcoded or `.env` files. This only works when the
-  cell calling it is run from the actual Colab browser UI — it times out (not a
-  clean error) when driven from an external client like VSCode's Jupyter extension
-  connected to the same Colab kernel, since the vault needs a round-trip to the
-  browser tab itself. Deliberately not worked around with a token file on Drive: a
-  file there is readable by anything with Drive access to that folder (any other
-  notebook, any app granted Drive access, Drive Desktop sync, anyone the folder
-  gets shared with) — not scoped to this notebook the way the vault is. If driving
-  this notebook from VSCode, the env-setup cell needs to be run from the actual
-  Colab UI once per fresh runtime; the token then stays in that kernel's memory
-  for the rest of the session.
-- HF auth + downloads go through `huggingface_hub` (`login`, `snapshot_download`,
-  `hf_hub_download`), cached under `HF_HOME`.
+- Secrets: `HF_TOKEN` (and `HUGGINGFACE_API_KEY`, same value) are entered via a
+  hidden `getpass` prompt each session, not hardcoded, not in a `.env` file, and
+  not persisted to Drive or local disk — the token exists only in that kernel's
+  memory for the session. This works the same whether the notebook is driven from
+  the Colab browser UI or an external client (e.g. VSCode's Jupyter extension),
+  unlike Colab's `userdata.get()` secrets vault, which needs a round-trip to the
+  actual browser tab and times out otherwise. The cost — re-entering the token
+  once per fresh runtime — is deliberate: a token file (on Drive or local disk)
+  would be more convenient but stays readable by anything with access to that
+  storage for as long as the file exists, not just this notebook for one session.
+- `snapshot_download`/`hf_hub_download` pick up `HF_TOKEN` from the environment
+  automatically (no explicit `huggingface_hub.login()` call needed) — downloads
+  are cached under `HF_HOME`.
 
 ## Dataset handling gotchas
 
@@ -51,10 +50,21 @@ using vLLM for inference, entirely inside Google Colab notebooks.
 - HF snapshot downloads can leave broken symlinks (interrupted downloads); there's a
   `check_all_targets` / re-download loop for this — always leave that check in place
   before extraction rather than assuming a snapshot is complete.
-- Google Drive's FUSE mount can lag behind newly extracted/written files, so image
-  loads use `safe_open_drive_img` with retries instead of a bare `PIL.Image.open`.
-  Keep using it (or equivalent retry wrapping) for anything reading files that were
-  just written to Drive in the same run.
+- Google Drive's FUSE mount can lag behind newly extracted/written files, and can
+  also fail a read outright with a plain `OSError` under load, not just be slow —
+  don't assume a bare read from a Drive-mounted path is reliable; wrap it with
+  retries (see `_stage_one` in the staging cell) for anything reading files that
+  were just written to Drive in the same run, or reading many files from Drive at
+  all.
+- Both staging cells (`_stage_one` for images, `_stage_file` for weights) copy to
+  a `.part`-suffixed temp name and `os.replace()` it into place atomically, rather
+  than writing the destination filename directly. This matters because a copy
+  interrupted partway (kernel restart, disconnect — both have happened in this
+  project) would otherwise leave a truncated file under the final filename, which
+  the "skip if already staged" `os.path.exists(dst)` check would then treat as
+  complete forever. For images specifically this is a silent-corruption risk, not
+  just a crash risk — a truncated JPEG often still decodes via PIL, just with
+  visible corruption, no exception. Keep this pattern for any new staging code.
 - The English-only questions JSON is picked by filename matching `MME` and excluding
   `CN` — if you add other MME-RealWorld variants, keep this filter honest.
 
@@ -70,48 +80,109 @@ using vLLM for inference, entirely inside Google Colab notebooks.
   enabled-but-empty on purpose so the download/inference loops print a loud skip
   instead of a model silently missing from the benchmark. Fill it in once a
   checkpoint exists, or point it at a self-quantized (GPTQModel/AutoGPTQ) path.
+- Each model's weights are staged from the Drive-backed HF cache to local disk
+  (`/content/model_weights/<key>`) right after download, and `weights_path` (what
+  `MODEL_CONFIGS` and `run_inference_pass` actually use) points at that local
+  copy, not the Drive one. Weight files are few and large, unlike the many-small
+  image files elsewhere in this notebook, so this isn't working around the same
+  problem — it's a precaution against safetensors' common use of `mmap` for
+  loading, which can turn into scattered small reads over a network-backed FUSE
+  mount depending on access order. The staging loop skips files already present
+  locally, so it's safe to rerun.
 - Models are loaded via `vllm.LLM(...)`, `dtype="float16"` (this project's Colab
   runtime is a T4 — Turing has no native bf16 tensor cores, so this isn't just a
-  default), `trust_remote_code=True`, `max_model_len=8192` (MME prompts are one
-  image + a short question; don't casually raise this — it directly trades away
-  KV-cache concurrency), `max_num_seqs=64`, `enable_prefix_caching=True`, and a
-  `compilation_config` with `cudagraph_capture_sizes` covering a full range (not
-  just the endpoints — a partial trailing batch with no matching captured graph
-  silently falls back to slow eager execution). Quantized variants pass
-  `quantization=<method>` (`"awq"` or `"gptq"`); `gpu_memory_utilization` (0.85) is
-  held constant across all variants deliberately, so a smaller quantized model
-  doesn't get an unfair throughput boost from extra KV-cache headroom that has
-  nothing to do with quantization.
+  default), `trust_remote_code=True`, `max_model_len=32768`, `max_num_seqs=64`,
+  and a `compilation_config` with `cudagraph_capture_sizes` covering a full
+  range (not just the endpoints — a
+  partial trailing batch with no matching captured graph silently falls back to
+  slow eager execution). Quantized variants pass `quantization=<method>` (`"awq"`
+  or `"gptq"`); `gpu_memory_utilization` (0.85) is held constant across all
+  variants deliberately, so a smaller quantized model doesn't get an unfair
+  throughput boost from extra KV-cache headroom that has nothing to do with
+  quantization.
+- `max_model_len` is a real, load-bearing value, not a knob to casually change in
+  either direction. MME-RealWorld images vary widely in resolution, and vision
+  tokenization scales with it — at least one image in the sample needs 16000+
+  tokens once encoded, so `max_model_len` needs real headroom above that, not
+  just above a "one image + a short question" assumption (that assumption was
+  wrong; a plain short-prompt guess of 8192 hit a hard failure on the larger
+  images). At the same time, leaving `max_model_len` unset entirely sizes the KV
+  cache for this model's full native 262144-token context across every one of
+  `max_num_seqs` concurrent sequences, which can fail engine startup outright
+  with an opaque "Engine core initialization failed" rather than a clear OOM.
+  32768 is chosen with headroom above the observed 16000+ floor, not tuned to an
+  exact minimum — if an even larger outlier image surfaces, raise it further
+  rather than assuming the current value is exact.
+  `cudagraph_capture_sizes` covering a full range (not just the endpoints — a
+  partial trailing batch with no matching captured graph silently falls back to
+  slow eager execution). Quantized variants pass `quantization=<method>` (`"awq"`
+  or `"gptq"`); `gpu_memory_utilization` (0.85) is held constant across all
+  variants deliberately, so a smaller quantized model doesn't get an unfair
+  throughput boost from extra KV-cache headroom that has nothing to do with
+  quantization.
+- `enable_prefix_caching` is `False`. This model uses a Mamba-hybrid architecture
+  (attention + state-space layers), and vLLM logs that it switches into a special
+  Mamba cache "align" mode specifically because prefix caching is on — engine
+  startup fails immediately after that log line. The win from prefix caching here
+  was always modest (only the shared chat-template preamble benefits; the actual
+  image+question content differs per request), not worth trading for a working
+  engine. Revisit once vLLM's hybrid-model prefix caching support matures — don't
+  flip it back on without confirming that first.
 - On this notebook's T4 hardware specifically, vLLM's fast Marlin kernel for
   AWQ/GPTQ is unavailable (Marlin needs Ampere+/sm_80, T4 is sm_75) — expect a
   slower fallback kernel and check the vLLM startup log for which one actually got
   selected before drawing conclusions from quantized throughput numbers.
 - Sampled images are staged from Drive to local disk (`/content/mme_sample_images`)
-  once, before chat payloads are built. `EXTRACT_DIR` on Drive is a single flat
+  once, before any chat payloads are built. `EXTRACT_DIR` on Drive is a single flat
   directory holding every image in the *full* dataset, not just the sample —
-  looking up files in a Drive-mounted directory that large is slow per-file, and
-  Drive's per-user rate limiting can add further backoff under concurrent access.
-  Copying just the ~10% sample locally first turns per-image reads into local disk
-  reads for the actual decode step, which are effectively free by comparison. The
-  staging cell skips files that already exist locally, so it's safe to rerun if
-  interrupted. `build_chat`/`safe_open_drive_img` resolve images relative to the
-  global `EXTRACT_DIR`, so the chat-prebuild cell temporarily repoints `EXTRACT_DIR`
-  at the local staged copy and restores it afterward — keep that restore if you
-  touch this cell, since other cells (and any future full-dataset run) expect
-  `EXTRACT_DIR` to mean the Drive copy.
-- Chat payloads (`build_chat`) are built **once**, before the per-model loop, and
-  reused across every model variant — the images/questions are identical across
-  fp16/AWQ/GPTQ, so rebuilding them per model is pure repeated decode work. If you
-  change what varies per model run, keep this precompute-once-reuse-across-models
-  structure; don't fold chat-building back inside `run_inference_pass`.
+  looking up files in a Drive-mounted directory that large is slow per-file, Drive's
+  per-user rate limiting can add further backoff under concurrent access, and Drive
+  can outright fail a read with an `OSError` under load. Copying just the ~10%
+  sample locally first (with retries, see above) turns every image read for the
+  rest of the run into a local disk read, isolating all Drive access to this one
+  step. The staging cell skips files that already exist locally, so it's safe to
+  rerun if interrupted. Once staging finishes, it repoints the global `EXTRACT_DIR`
+  at the local copy for the rest of the run — `build_chat` always resolves images
+  relative to `EXTRACT_DIR`, so nothing downstream needs to know staging happened.
+- Images are read as raw bytes and base64-encoded into a `data:` URL
+  (`image_to_data_url`, `image_url` content type) rather than opened via PIL and
+  passed as `image_pil` — this skips a local image decode entirely (vLLM decodes
+  server-side) and keeps a built chat payload's memory footprint close to the
+  compressed file size instead of a full decoded RGB array.
+- `ThreadPoolExecutor`, not `torch.utils.data.DataLoader`, parallelizes the
+  per-item read+encode work. DataLoader's value is parallel tensor collation for
+  a loop where *we* construct the tensors fed to a model — we don't; we hand
+  `llm.chat()` a list of dicts, and vLLM's engine does its own tokenization and
+  tensorization. DataLoader workers would also mean `multiprocessing`, which has
+  to pickle the (sizeable) base64 strings across a process boundary, and spawning
+  worker processes after CUDA is already initialized in the main process (which
+  it will be, since vLLM owns the GPU) is a known source of flaky interactions.
+  Threads are the right tool here: this work is I/O-bound (local file reads),
+  and there's no tensor/GPU boundary in our code for pinned memory to help with
+  either — that's a different abstraction level than "build a request payload."
+- Chat payloads are built inside `run_inference_pass`, a `GROUP_BATCHES` window
+  (currently 3 chunks, `CHAT_GROUP_SIZE` items) at a time, immediately before that
+  window's inference calls — not for the whole sample up front. This bounds memory
+  to one window's worth of chats regardless of sample size, at the cost of
+  redoing the read/encode once per model pass instead of once for all three;
+  that's an acceptable trade specifically because staging already made those reads
+  local and cheap. If you change this, keep chat-building windowed and immediately
+  followed by its own inference calls — don't go back to building the whole
+  sample's chats before any inference starts.
+- The window *after* the one currently running inference is prefetched on a
+  dedicated single-worker thread pool while `llm.chat()` runs, rather than being
+  built only once inference for the current window finishes. GPU inference for a
+  window of `CHAT_GROUP_SIZE` multimodal requests takes meaningfully longer than
+  reading+base64-encoding the next window's local images, so this hides most of
+  the build cost behind GPU time. If you change the chat-building loop, keep this
+  one-window-ahead prefetch rather than reverting to build-then-run-then-build.
 - Inference runs in chunks sized to `MAX_NUM_SEQS` (currently 64, shared with
   `max_num_seqs` above so each chunk actually saturates vLLM's scheduler) using a
-  single `llm.chat(...)` call per chunk with multimodal messages (`image_pil` +
-  text) — one call per chunk lets vLLM's continuous batching interleave
-  prefill/decode across the whole chunk, rather than many small serialized calls
-  that would leave the GPU idle between them. Results are written to the results
-  JSON incrementally after every chunk — keep this pattern for any new run loop
-  so a killed Colab kernel doesn't lose completed work.
+  single `llm.chat(...)` call per chunk — one call per chunk lets vLLM's continuous
+  batching interleave prefill/decode across the whole chunk, rather than many small
+  serialized calls that would leave the GPU idle between them. Results are written
+  to the results JSON incrementally after every chunk — keep this pattern for any
+  new run loop so a killed Colab kernel doesn't lose completed work.
 - Between loading different model variants in the same session, always tear down
   the previous one first: `destroy_model_parallel()`, `del llm`, `gc.collect()`,
   `torch.cuda.empty_cache()`, `torch.cuda.synchronize()`. This matters even more
@@ -119,11 +190,10 @@ using vLLM for inference, entirely inside Google Colab notebooks.
   run — any measurement taken without this teardown is contaminated by the prior
   model's residency.
 - `sample_questions.json` (10% stratified by `Task`, cached under `PROJECT_DIR`) is
-  the fast-iteration dataset. Full-dataset runs are a separate, more expensive pass —
-  don't conflate the two when comparing numbers across runs. Note the pre-built
-  chat cache above holds every decoded image in memory, which is fine for the
-  sample but should be reconsidered (e.g. build chats per-chunk) for a full-dataset
-  run.
+  the fast-iteration dataset. Full-dataset runs are a separate, more expensive pass
+  — don't conflate the two when comparing numbers across runs, and note that a
+  full-dataset run means staging (and re-staging on every fresh runtime) a much
+  larger set of images, which this design hasn't been sized for.
 
 ## Evaluation & benchmarking
 

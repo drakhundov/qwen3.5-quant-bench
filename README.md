@@ -70,32 +70,64 @@ Speed work falls into three buckets: not re-fetching things, not re-computing th
 and getting more out of the GPU per second it's busy. In roughly the order they pay
 off:
 
+- **The full question set is only loaded when there's no cached sample yet.**
+  Checking for `sample_questions.json` happens *before* touching the ~23,600-question
+  source file, not after — a run with an already-cached sample never parses the full
+  file at all.
 - **Downloads are concurrent and accelerated.** All enabled models' weights download
   in parallel (`ThreadPoolExecutor` around `snapshot_download`) instead of one after
   another, and `HF_HUB_ENABLE_HF_TRANSFER=1` swaps in HF's Rust-based accelerated
   downloader for the actual transfer. Combined with everything landing on Drive (see
   Infrastructure above), a repo/weight/dataset is fetched at most once, ever, per
   Drive.
-- **Sampled images are staged to local disk before decoding.** `EXTRACT_DIR` on
-  Drive is a single flat directory holding every image in the full dataset, not
-  just the sample — per-file lookups against a Drive-mounted directory that large
-  are slow, and Drive's per-user rate limiting can add further backoff under
-  concurrent access. The ~10% sample's images are bulk-copied to local disk once
-  (skipping any already staged, so an interrupted copy resumes), and the actual
-  decode step reads from that local copy instead of Drive.
-- **Images are decoded once, not once per model.** The sample question set and every
-  model variant (fp16/AWQ/GPTQ) share the exact same images and prompts — the only
-  thing that changes between runs is which `LLM` processes them. Chat payloads are
-  built once up front with a thread pool and reused across all three inference
-  passes, instead of being rebuilt from scratch for each one. Trade-off: this holds
-  every decoded image in memory for the run, which is fine for the 10% sample but
-  worth revisiting for a full-dataset run.
-- **`max_model_len` is sized to the actual workload, not the model's ceiling.**
-  MME prompts are one image plus a short question, nowhere near vLLM's reported
-  context ceiling. A needlessly large `max_model_len` reserves KV-cache block
-  space for sequence lengths that never occur, directly capping how many requests
-  can run concurrently — so it's set to 8192, the single largest throughput lever
-  here, especially on a 16GB T4.
+- **Weights are staged to local disk before vLLM loads them.** Unlike the
+  many-small-image problem below, weight files are few and large (a handful of
+  safetensors shards) — bulk sequential reads are Drive's best case, not its worst.
+  They're still copied to local disk once per session before `vllm.LLM(...)` reads
+  them, as a precaution: safetensors loading commonly memory-maps its files, and
+  mmap'd access over a network-backed FUSE mount can turn into scattered small
+  reads depending on access order, which would reintroduce the same problem the
+  image staging below fixes — just hidden inside one file instead of spread across
+  many.
+- **All Drive access is isolated to one staging step.** `EXTRACT_DIR` on Drive is a
+  single flat directory holding every image in the full dataset, not just the
+  sample — per-file lookups against a Drive-mounted directory that large are slow,
+  Drive's per-user rate limiting can add further backoff under concurrent access,
+  and Drive can fail a read outright with an I/O error under load rather than just
+  being slow. The ~10% sample's images are bulk-copied to local disk once, with
+  retries around each copy (skipping any already staged, so an interrupted run
+  resumes), and every read after that point — for every model, every batch — comes
+  from that local copy instead of Drive.
+- **Images are read as base64, not decoded locally.** Each staged image is read as
+  raw bytes and base64-encoded into vLLM's `image_url` content type, rather than
+  opened with PIL and passed as `image_pil`. This skips a local decode step
+  entirely (vLLM decodes on its own side) and keeps each chat payload close to the
+  compressed file size in memory, instead of a full decoded RGB array.
+- **Chat payloads are built in small windows, immediately before they're used, not
+  for the whole sample up front.** `run_inference_pass` builds chats a few chunks
+  at a time (`GROUP_BATCHES`, currently 3 × 64 = 192 items) right before running
+  inference on that window, then moves on — instead of building all ~2,300 chats
+  before any inference starts. This bounds memory to one window's worth of data
+  regardless of sample size. Trade-off: since chats aren't cached across models
+  anymore, each of the three passes re-reads and re-encodes the same images — but
+  since staging already made those reads local, that repeat cost is small compared
+  to what it would have cost against Drive.
+- **The next window is prefetched while the current one runs on the GPU.** Building
+  a window of chats (local reads + base64 encode) is fast compared to running that
+  window through the model, so the *next* window is built on a background thread
+  while `llm.chat()` is still working on the current one, instead of waiting for
+  inference to finish before starting the next build. This hides most of the
+  build time behind GPU time rather than paying for it serially between windows.
+- **`max_model_len` is sized to the actual workload, not the model's ceiling —
+  but "the actual workload" turned out bigger than expected.** MME-RealWorld
+  images vary widely in resolution, and vision tokenization scales with it; at
+  least one image in the sample needs 16000+ tokens once encoded, well past a
+  "one image, short question" assumption. `max_model_len` is set to 32768 —
+  real headroom above that observed floor, not tuned to an exact minimum — while
+  staying far below vLLM's reported native ceiling for this model. Leaving it
+  unset entirely would size the KV cache for that full native context across
+  every concurrent sequence, which can fail engine startup outright rather than
+  just being wasteful.
   - `max_num_seqs` is set explicitly (64) and `gpu_memory_utilization` is held
     constant across fp16/AWQ/GPTQ on purpose — letting a smaller quantized model
     grab extra KV-cache headroom would make it look faster for a reason unrelated to
@@ -114,9 +146,13 @@ off:
   falls back to slow eager execution. `cudagraph_capture_sizes` covers a full
   range (`[1, 2, 4, 8, 16, 32, 64]`), not just the endpoints, so odd-sized
   trailing chunks stay on the fast path.
-- **Prefix caching is on.** Every request shares the same chat-template preamble;
-  `enable_prefix_caching=True` lets vLLM skip recomputing it. Modest, since the
-  image and question content still differ per request, but free.
+- **Prefix caching is off.** It would have been a modest win (every request
+  shares the same chat-template preamble, though the image and question content
+  still differ per request) — but this model uses a Mamba-hybrid architecture,
+  and vLLM logs that enabling prefix caching switches it into a special Mamba
+  cache mode that fails engine startup outright for this model. Not worth a
+  broken engine for a modest win; revisit once vLLM's hybrid-model support for
+  this matures.
 - **`dtype="float16"`, deliberately.** T4 (Turing) has no native bf16 tensor cores,
   so fp16 isn't just a default here — it's the dtype that actually runs fast on this
   hardware.
