@@ -62,22 +62,50 @@ own CUDA accounting, since vLLM runs the actual model in a separate subprocess �
 allocated. See `CLAUDE.md` for the specifics if either of these need touching
 again.
 
-**Where these numbers actually come from, and why it isn't as simple as reading
-`RequestOutput.metrics`.** vLLM's offline batch API doesn't hand you per-request
-timing for free — its `LLM` class defaults per-request metric collection to *off*,
-and even with it explicitly enabled, the object you get back has gone through more
-than one redesign across vLLM versions, so the field names aren't the ones you'd
-find in older docs or examples. Latency/TTFT/TPOT here are computed from that
-object with both of those accounted for explicitly, not assumed. Memory numbers
-come from querying the GPU device directly (NVML) rather than the Python process's
-own CUDA accounting, since vLLM runs the actual model in a separate subprocess —
-`torch.cuda.*` in the calling process can't see memory that process never
-allocated. See `CLAUDE.md` for the specifics if either of these need touching
-again.
-
 **Accuracy scoring** always goes through the upstream `MME-RealWorld` evaluation
 script rather than a custom scorer, to avoid silently drifting from how the
 benchmark is meant to be graded.
+
+## Results
+
+**First full-sample run** — 2026-09-22, the 10% stratified sample (2,360
+questions: 284 Reasoning / 2,076 Perception). GPTQ wasn't run — no public
+checkpoint exists yet (see Methodology). Full numbers, including p50/p90/p99 and
+the queue/prefill/decode breakdown, are in `benchmark_summary.json`.
+
+| Model | Accuracy | Output tok/s | Latency (avg / p99) | TTFT avg | TPOT avg | Peak VRAM |
+|---|---|---|---|---|---|---|
+| fp16 | 45.55% | 155.5 | 16.58s / 51.23s | 5.26s | 0.434s | 42.37 GB |
+| AWQ | 40.97% | 156.4 | 19.46s / 54.17s | 5.77s | 0.408s | 42.51 GB |
+
+Accuracy by task:
+
+| Model | Reasoning | Perception | Overall |
+|---|---|---|---|
+| fp16 | 32.04% | 47.40% | 45.55% |
+| AWQ | 32.04% | 42.20% | 40.97% |
+
+**AWQ wasn't a clear win here.** It edged out fp16 on raw decode speed (TPOT
+0.408s vs 0.434s) and output tok/s, but wall-clock time for the full pass was
+longer (1775.9s vs 1643.7s, plus a longer model load — 274.7s vs 223.3s), overall
+latency was higher, and accuracy dropped about 4.6 points (45.55% → 40.97%,
+entirely from Perception; Reasoning was unchanged). This lines up with the
+Marlin-kernel caveat in Optimization methods below — T4 can't use vLLM's fast
+Marlin kernel for AWQ, so quantization didn't translate into the throughput win
+it would on Ampere+ hardware. Worth re-checking against the full dataset, and
+against a GPU that actually gets the Marlin path, before drawing a general
+conclusion about this method.
+
+**Caveats worth reading the raw numbers with:**
+- **Truncated requests**: 185/2360 (fp16) and 171/2360 (AWQ) — about 7–8% of
+  requests hit `max_tokens=512` before stopping naturally. Their latency/TPOT
+  reflect that artificial cutoff, and their answer may have been cut off before
+  the accuracy eval scored it (see `truncated_requests` in Metrics above).
+- **Corrupted requests**: 0 for both models.
+- **Preemptions**: not available (`null`) for both — this vLLM version didn't
+  populate `num_preemptions` on these requests, not necessarily zero preemptions.
+- **Unload residual**: 0.449 GB (fp16) vs 0.0 GB (AWQ) — both small relative to
+  peak VRAM; not enough of a pattern from one run to call either a leak.
 
 ## Infrastructure
 
